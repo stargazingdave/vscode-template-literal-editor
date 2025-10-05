@@ -9,6 +9,27 @@ import throttle = require('lodash.throttle');
 
 // TODO Clean up artificial delays to only those that are really needed, but testing those seems flaky.
 
+const DEFAULT_TAG_LANGS: Record<string, string> = {
+    javascript: 'javascript',
+    html: 'html',
+    css: 'css',
+    sql: 'sql',
+    gql: 'graphql',
+    graphql: 'graphql',
+    md: 'markdown',
+    markdown: 'markdown',
+    c: 'c',
+    cpp: 'cpp',
+    cxx: 'cpp',
+    python: 'python',
+    py: 'python',
+    sh: 'shellscript',
+    bash: 'shellscript',
+    xml: 'xml',
+    json: 'json',
+    yaml: 'yaml'
+};
+
 const SYNC_THROTTLE_MS = 100;
 
 const isJsTsLanguageId = (lang: string) =>
@@ -166,32 +187,29 @@ export function activate(_context: vscode.ExtensionContext) {
             }
 
             if (templateStart !== 0) {
-                const languages = await vscode.languages.getLanguages();
-                // How to get proper language list, with icons etc?
-                // Not possible yet I guess:
-                // https://github.com/Microsoft/vscode/blob/5aea732/src/vs/workbench/browser/parts/editor/editorStatus.ts#L747-L763
-                const sorted = [previouslyPickedLanguage].concat(languages.filter(lang => lang !== previouslyPickedLanguage));
-                const pickedLanguage = await vscode.window.showQuickPick(sorted, { placeHolder: 'Open in Language Mode' });
-                if (pickedLanguage) {
-                    previouslyPickedLanguage = pickedLanguage;
-                    try {
-                        await activateSubdocument(
-                            pickedLanguage,
-                            editor,
-                            doc.positionAt(templateStart),
-                            doc.positionAt(templateEnd),
-                        );
-                    } catch (err) {
-                        if (DEBUG) {
-                            if (err instanceof Error && err.stack) {
-                                console.error('ACTIVATION ERROR: %s', err.stack);
-                            } else {
-                                console.error('ACTIVATION ERROR: %s', err);
-                            }
-                        }
-                        throw err;
-                    };
+                let pickedLanguage: string | null = null;
+
+                // comment marker detection
+                const marker = getLeadingCommentMarker(doc, templateStart);
+                pickedLanguage = resolveLanguageId(marker);
+
+                // fallback to picker only if no marker match
+                if (!pickedLanguage) {
+                    const languages = await vscode.languages.getLanguages();
+                    const sorted = [previouslyPickedLanguage].concat(languages.filter(l => l !== previouslyPickedLanguage));
+                    pickedLanguage = await vscode.window.showQuickPick(sorted, { placeHolder: 'Open in Language Mode' }) || null;
                 }
+
+                if (!pickedLanguage) return; // user cancelled
+
+                previouslyPickedLanguage = pickedLanguage;
+                await activateSubdocument(
+                    pickedLanguage,
+                    editor,
+                    doc.positionAt(templateStart),
+                    doc.positionAt(templateEnd),
+                );
+                return;
             } else {
                 console.warn(
                     'Literal not found under cursor. If in error, please modify the source or templateLiteralEditor.regexes.%s configuration for your needs',
@@ -875,6 +893,56 @@ async function shortDelay() {
             resolve();
         }, 0);
     });
+}
+
+function resolveLanguageId(tagOrMarker: string | null): string | null {
+    if (!tagOrMarker) return null;
+    const key = tagOrMarker.toLowerCase();
+    return DEFAULT_TAG_LANGS[key] || null;
+}
+
+/**
+ * Reads a marker near the opening backtick:
+ *   - same line before the backtick: `/* sql *\/` or `// sql`
+ *   - OR previous non-empty line if it's a pure marker line.
+ */
+function getLeadingCommentMarker(
+    doc: vscode.TextDocument,
+    templateStart: number
+): string | null {
+    const backtickPos = doc.positionAt(templateStart);
+    const lineText = doc.lineAt(backtickPos.line).text;
+    const beforeBacktick = lineText.slice(0, backtickPos.character);
+
+    // same line: last /* tag */ before the backtick
+    const blockRe = /\/\*\s*([a-zA-Z0-9_.-]+)\s*\*\//g;
+    let m: RegExpExecArray | null, lastBlock: string | null = null;
+    while ((m = blockRe.exec(beforeBacktick)) !== null) lastBlock = m[1];
+
+    // same line: last // tag before the backtick (must be alone after //)
+    let lastLine: string | null = null;
+    const lastSlashes = beforeBacktick.lastIndexOf('//');
+    if (lastSlashes >= 0) {
+        const after = beforeBacktick.slice(lastSlashes + 2);
+        const mm = /^\s*([a-zA-Z0-9_.-]+)\s*$/.exec(after);
+        if (mm) lastLine = mm[1];
+    }
+
+    if (lastBlock) return lastBlock;
+    if (lastLine) return lastLine;
+
+    // previous non-empty line: must be a pure marker line
+    let prev = backtickPos.line - 1;
+    while (prev >= 0) {
+        const t = doc.lineAt(prev).text;
+        if (t.trim().length === 0) { prev--; continue; } // skip blanks
+        let mm2 = /^\s*\/\*\s*([a-zA-Z0-9_.-]+)\s*\*\/\s*$/.exec(t);
+        if (mm2) return mm2[1];
+        mm2 = /^\s*\/\/\s*([a-zA-Z0-9_.-]+)\s*$/.exec(t);
+        if (mm2) return mm2[1];
+        break; // first non-empty line had other code → stop
+    }
+    return null;
 }
 
 // Cleanup on exit, to avoid stale editors on reload. Earlier this wouldn't work, and still cannot be tested on Extension
