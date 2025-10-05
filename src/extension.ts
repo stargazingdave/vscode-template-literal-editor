@@ -298,36 +298,23 @@ export function activate(_context: vscode.ExtensionContext) {
         await fs.mkdir(tempDir, { recursive: true });
         const tempPath = path.join(tempDir, `tle-${Date.now()}-${Math.random().toString(36).slice(2)}.${await ext}`);
 
-        // Base indent = start-of-line indent for the backtick line
+        // figure base indent columns once as you do already
         const lineInfo = doc.lineAt(templateRange.start.line);
         const baseCols = lineInfo.firstNonWhitespaceCharacterIndex;
 
-        // Respect user setting (default true in package.json is fine too)
-        const cfg = vscode.workspace.getConfiguration('templateLiteralEditor');
-        const stripOnOpen = cfg.get<boolean>('stripIndentOnOpen', true);
-
         const openedRaw = doc.getText(templateRange);
+        const nl = (doc.eol === vscode.EndOfLine.LF) ? '\n' : '\r\n';
 
-        // Strip enough columns so the subdoc opens flush-left but preserves internal relative indent.
-        // That means: base indent + the extra levels we add on sync.
-        let openedContent = openedRaw;
-        if (stripOnOpen) {
-            const tabSize =
-                typeof editor.options.tabSize === 'number' ? editor.options.tabSize : 4;
-            const extraCols = behavior.offsetIndentOnSync
-                ? Math.max(0, behavior.extraIndentLevels) * tabSize
-                : 0;
-            const stripCols = baseCols + extraCols;
+        // 1) strip indent so the subdoc is flush-left
+        let openedContent = stripIndentFrom(openedRaw, baseCols, doc.eol, editor.options);
 
-            openedContent =
-                '\n' +
-                stripIndentFrom(openedRaw, stripCols, doc.eol, editor.options)
-                    // normalize multiple leading blank lines to a single one
-                    .replace(/^\s*\n*/, '');
-        }
+        // 2) ensure EXACTLY one leading blank line, independent of current content/EOL
+        //    - if there are 0, we add 1
+        //    - if there are 2+, we collapse to 1
+        openedContent = openedContent.replace(/^(?:\r?\n)*/, nl);
 
-        // Write and open
         await fs.writeFile(tempPath, openedContent, 'utf8');
+
         const subdoc = await vscode.workspace.openTextDocument(vscode.Uri.file(tempPath));
         await vscode.languages.setTextDocumentLanguage(subdoc, language);
 
