@@ -2,6 +2,9 @@
 
 import * as vscode from 'vscode';
 import * as ts from 'typescript';
+import * as os from 'os';
+import * as path from 'path';
+import { promises as fs } from 'fs';
 import throttle = require('lodash.throttle');
 
 // TODO Clean up defensive development guards (DEBUG, most try-catches, etc), as the extension seems to work without errors,
@@ -271,11 +274,40 @@ export function activate(_context: vscode.ExtensionContext) {
         // Create subdocument with chosen language.
         // Could be made configurable depending on template tag, keybinding, etc.
 
-        // Always creates a new untitled file.
-        // NOTE: setting content here to fix undo history including the initially empty doc. v1.11 api only
-        const subdoc = await vscode.workspace.openTextDocument({ language, content: doc.getText(templateRange) });
+        // Create a temp file with correct extension for the language
+        const ext = vscode.languages.getLanguages().then(() => {
+            // crude but fine for known languages
+            const map: Record<string, string> = {
+                javascript: 'js', typescript: 'ts',
+                html: 'html', css: 'css', sql: 'sql',
+                c: 'c', cpp: 'cpp', python: 'py', shellscript: 'sh',
+                json: 'json', xml: 'xml', markdown: 'md'
+            };
+            return map[language] || language;
+        });
 
-        activeDocuments.set(doc, { subdoc, async closeSubdocumentWithReason() { } });
+        const tempDir = path.join(os.tmpdir(), 'tle-subdocs');
+        await fs.mkdir(tempDir, { recursive: true });
+        const tempPath = path.join(tempDir, `tle-${Date.now()}-${Math.random().toString(36).slice(2)}.${await ext}`);
+
+        await fs.writeFile(tempPath, doc.getText(templateRange), 'utf8');
+        const subdoc = await vscode.workspace.openTextDocument(vscode.Uri.file(tempPath));
+
+        activeDocuments.set(doc, {
+            subdoc,
+            // we’ll hook cleanup (delete temp dir) in closeSubdocumentWithReason below
+            async closeSubdocumentWithReason(_reason: string) {
+                // Cleanup temp directory
+                try {
+                    const dir = path.dirname(subdoc.uri.fsPath);
+                    if (path.basename(dir).startsWith('tle-')) {
+                        await removeDirRecursive(dir);
+                    }
+                } catch (e) {
+                    if (DEBUG) console.warn('Temp cleanup failed:', e);
+                }
+            }
+        });
 
         // Open subeditor in side by side view. Note that editor arrangement is fixed for simplicity.
         // NOTE: use these, as editor objects will be stale when refocused in tabs, and won't reflect group changes in any case.
@@ -730,6 +762,15 @@ export function activate(_context: vscode.ExtensionContext) {
                 // Close untitled subdocs via action, moves focus so may pipe quick keypresses to wrong doc unfortunately
                 await closeSubeditor();
 
+                // Cleanup temp directory
+                try {
+                    const dir = path.dirname(subdoc.uri.fsPath);
+                    if (path.basename(dir).startsWith('tle-')) {
+                        await removeDirRecursive(dir);
+                    }
+                } catch (e) {
+                    if (DEBUG) console.warn('Temp cleanup failed:', e);
+                }
             } catch (err) {
                 if (DEBUG) {
                     if (err instanceof Error && err.stack) {
@@ -943,6 +984,23 @@ function getLeadingCommentMarker(
         break; // first non-empty line had other code → stop
     }
     return null;
+}
+
+async function removeDirRecursive(dir: string) {
+    try {
+        const entries = await fs.readdir(dir, { withFileTypes: true } as any);
+        for (const e of entries) {
+            const p = path.join(dir, e);
+            if ((e as any).isDirectory?.()) {
+                await removeDirRecursive(p);
+            } else {
+                await fs.unlink(p).catch(() => { });
+            }
+        }
+        await fs.rmdir(dir).catch(() => { });
+    } catch {
+        // ignore
+    }
 }
 
 // Cleanup on exit, to avoid stale editors on reload. Earlier this wouldn't work, and still cannot be tested on Extension
