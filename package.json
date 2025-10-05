@@ -142,6 +142,17 @@
                     "additionalProperties": {
                         "type": "string"
                     }
+                },
+                "templateLiteralEditor.offsetIndentOnSync": {
+                    "type": "boolean",
+                    "default": false,
+                    "markdownDescription": "When syncing back into the template literal, indent the embedded code relative to the line start."
+                },
+                "templateLiteralEditor.extraIndentLevels": {
+                    "type": "number",
+                    "default": 1,
+                    "minimum": 0,
+                    "markdownDescription": "How many extra indent levels to add when offsetIndentOnSync is enabled. One level = a single tab if tabs, otherwise 'tabSize' spaces."
                 }
             }
         }

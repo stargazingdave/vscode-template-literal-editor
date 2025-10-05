@@ -52,6 +52,7 @@ if (DEBUG) {
 // Tracks all documents with open subdocuments
 const activeDocuments = new Map<vscode.TextDocument, {
     subdoc: vscode.TextDocument,
+    behavior: Behavior,
     closeSubdocumentWithReason(reason: string): Promise<void>,
 }>();
 
@@ -189,28 +190,34 @@ export function activate(_context: vscode.ExtensionContext) {
                 // Omitted
             }
 
+
+
             if (templateStart !== 0) {
+                const baseBehavior = readDefaultBehavior();
+                const pragma = parseSingleLineTlePragma(doc, templateStart);
+
+                // 1) choose language
                 let pickedLanguage: string | null = null;
-
-                // comment marker detection
-                const marker = getLeadingCommentMarker(doc, templateStart);
-                pickedLanguage = resolveLanguageId(marker);
-
-                // fallback to picker only if no marker match
-                if (!pickedLanguage) {
+                if (pragma?.lang) {
+                    pickedLanguage = pragma.lang;
+                } else {
                     const languages = await vscode.languages.getLanguages();
                     const sorted = [previouslyPickedLanguage].concat(languages.filter(l => l !== previouslyPickedLanguage));
                     pickedLanguage = await vscode.window.showQuickPick(sorted, { placeHolder: 'Open in Language Mode' }) || null;
                 }
-
                 if (!pickedLanguage) return; // user cancelled
-
                 previouslyPickedLanguage = pickedLanguage;
+
+                // 2) compute behavior from defaults + pragma
+                const behavior = behaviorFrom(baseBehavior, pragma || null);
+
+                // 3) go
                 await activateSubdocument(
                     pickedLanguage,
                     editor,
                     doc.positionAt(templateStart),
                     doc.positionAt(templateEnd),
+                    behavior
                 );
                 return;
             } else {
@@ -241,6 +248,7 @@ export function activate(_context: vscode.ExtensionContext) {
         editor: vscode.TextEditor,
         start: vscode.Position,
         end: vscode.Position,
+        behavior: Behavior
     ) {
         const doc = editor.document;
         // Keep track of document range where template literal resides
@@ -290,23 +298,28 @@ export function activate(_context: vscode.ExtensionContext) {
         await fs.mkdir(tempDir, { recursive: true });
         const tempPath = path.join(tempDir, `tle-${Date.now()}-${Math.random().toString(36).slice(2)}.${await ext}`);
 
-        await fs.writeFile(tempPath, doc.getText(templateRange), 'utf8');
+        const lineInfo = doc.lineAt(templateRange.start.line);
+        const baseCols = lineInfo.firstNonWhitespaceCharacterIndex;
+
+        const cfg = vscode.workspace.getConfiguration('templateLiteralEditor');
+        const stripOnOpen = cfg.get<boolean>('stripIndentOnOpen', true); // default can be false if you prefer
+        const openedRaw = doc.getText(templateRange);
+
+        // make the subdoc flush-left to avoid double-indenting later
+        const openedContent = stripOnOpen
+            ? stripIndentFrom(openedRaw, baseCols, doc.eol, editor.options)
+            : openedRaw;
+
+        await fs.writeFile(tempPath, openedContent, 'utf8');
+
         const subdoc = await vscode.workspace.openTextDocument(vscode.Uri.file(tempPath));
+
+        await vscode.languages.setTextDocumentLanguage(subdoc, language);
 
         activeDocuments.set(doc, {
             subdoc,
-            // we’ll hook cleanup (delete temp dir) in closeSubdocumentWithReason below
-            async closeSubdocumentWithReason(_reason: string) {
-                // Cleanup temp directory
-                try {
-                    const dir = path.dirname(subdoc.uri.fsPath);
-                    if (path.basename(dir).startsWith('tle-')) {
-                        await removeDirRecursive(dir);
-                    }
-                } catch (e) {
-                    if (DEBUG) console.warn('Temp cleanup failed:', e);
-                }
-            }
+            behavior,
+            async closeSubdocumentWithReason(_reason: string) { /* ... */ }
         });
 
         // Open subeditor in side by side view. Note that editor arrangement is fixed for simplicity.
@@ -626,30 +639,54 @@ export function activate(_context: vscode.ExtensionContext) {
                 // We have to always take a new reference to the editor, as it may have been hidden
                 // and a new editor may need to be created.
                 const newEditor = await vscode.window.showTextDocument(doc, editorViewColumn, /*preserveFocus*/ true);
-                const editOk = await newEditor.edit(editBuilder => {
-                    // We don't care about actual edits and partial templateRange synchronization,
-                    // just copy everything in case there are changes
 
-                    // Mark next edit as originating from subdocument. Does not consider multiple edits
-                    // at the same time to both documents.
+                // pull per-literal behavior we stored
+                const { behavior } = activeDocuments.get(doc)!;
+
+                // Build indent based on the START of the line (not the backtick column),
+                // then push N extra levels.
+                let indent = '';
+                let closeIndentStr = '';
+                const raw = subdoc.getText();
+                const nl = (doc.eol === vscode.EndOfLine.LF) ? '\n' : '\r\n';
+
+                let content = raw;
+
+                if (behavior.offsetIndentOnSync) {
+                    const lineInfo = doc.lineAt(templateRange.start.line);
+                    const baseCols = lineInfo.firstNonWhitespaceCharacterIndex;
+                    const baseIndentStr = makeIndentString(newEditor.options, baseCols);
+
+                    const tabSize = typeof newEditor.options.tabSize === 'number' ? newEditor.options.tabSize : 4;
+                    const oneLevel = (newEditor.options.insertSpaces === false) ? '\t' : ' '.repeat(tabSize);
+                    const extra = oneLevel.repeat(Math.max(0, behavior.extraIndentLevels));
+
+                    indent = baseIndentStr + extra;   // code lines
+                    closeIndentStr = baseIndentStr;   // closing backtick one level less than code
+
+                    // indent the code
+                    content = applyIndentOffsetTo(raw, indent, doc.eol);
+
+                    // ensure a trailing newline, then place closing backtick indent
+                    const trimmed = content.replace(/[ \t]+$/g, '');
+                    content = trimmed.endsWith(nl) ? trimmed : trimmed + nl;
+                    content += closeIndentStr;
+                }
+
+                const editOk = await newEditor.edit(editBuilder => {
                     changeOrigin = 'subdocument';
-                    editBuilder.replace(templateRange, subdoc.getText());
-                    // We calculate new range based on subdoc size. Depends on both documents having the same config.
+                    editBuilder.replace(templateRange, content);
+
+                    const newLines = content.split(/\r\n|\r|\n/);
                     templateRange = new vscode.Range(
-                        // Start row and col stay the same
                         templateRange.start.line,
                         templateRange.start.character,
-                        // End row depends on subdoc line count
-                        templateRange.start.line + subdoc.lineCount - 1,
-                        // End col depends on whether there is only single line or more
-                        (subdoc.lineCount === 1 ? templateRange.start.character : 0) +
-                        subdoc.lineAt(subdoc.lineCount - 1).range.end.character
-                    )
+                        templateRange.start.line + newLines.length - 1,
+                        (newLines.length === 1 ? templateRange.start.character : 0) +
+                        (newLines.length ? newLines[newLines.length - 1].length : 0)
+                    );
                 });
-                if (!editOk) {
-                    // If there are multiple edits, they may not succeed, and then templateRange will be out of sync. Better to fail then.
-                    throw new Error('Sync to document did not succeed');
-                }
+                if (!editOk) throw new Error('Sync to document did not succeed');
             } catch (err) {
                 if (DEBUG) {
                     if (err instanceof Error && err.stack) {
@@ -892,7 +929,7 @@ export function activate(_context: vscode.ExtensionContext) {
         }
 
         // We are ready, update document disposer to the proper one
-        activeDocuments.set(doc, { subdoc, closeSubdocumentWithReason });
+        activeDocuments.set(doc, { subdoc, behavior, closeSubdocumentWithReason });
     }
 }
 
@@ -936,56 +973,6 @@ async function shortDelay() {
     });
 }
 
-function resolveLanguageId(tagOrMarker: string | null): string | null {
-    if (!tagOrMarker) return null;
-    const key = tagOrMarker.toLowerCase();
-    return DEFAULT_TAG_LANGS[key] || null;
-}
-
-/**
- * Reads a marker near the opening backtick:
- *   - same line before the backtick: `/* sql *\/` or `// sql`
- *   - OR previous non-empty line if it's a pure marker line.
- */
-function getLeadingCommentMarker(
-    doc: vscode.TextDocument,
-    templateStart: number
-): string | null {
-    const backtickPos = doc.positionAt(templateStart);
-    const lineText = doc.lineAt(backtickPos.line).text;
-    const beforeBacktick = lineText.slice(0, backtickPos.character);
-
-    // same line: last /* tag */ before the backtick
-    const blockRe = /\/\*\s*([a-zA-Z0-9_.-]+)\s*\*\//g;
-    let m: RegExpExecArray | null, lastBlock: string | null = null;
-    while ((m = blockRe.exec(beforeBacktick)) !== null) lastBlock = m[1];
-
-    // same line: last // tag before the backtick (must be alone after //)
-    let lastLine: string | null = null;
-    const lastSlashes = beforeBacktick.lastIndexOf('//');
-    if (lastSlashes >= 0) {
-        const after = beforeBacktick.slice(lastSlashes + 2);
-        const mm = /^\s*([a-zA-Z0-9_.-]+)\s*$/.exec(after);
-        if (mm) lastLine = mm[1];
-    }
-
-    if (lastBlock) return lastBlock;
-    if (lastLine) return lastLine;
-
-    // previous non-empty line: must be a pure marker line
-    let prev = backtickPos.line - 1;
-    while (prev >= 0) {
-        const t = doc.lineAt(prev).text;
-        if (t.trim().length === 0) { prev--; continue; } // skip blanks
-        let mm2 = /^\s*\/\*\s*([a-zA-Z0-9_.-]+)\s*\*\/\s*$/.exec(t);
-        if (mm2) return mm2[1];
-        mm2 = /^\s*\/\/\s*([a-zA-Z0-9_.-]+)\s*$/.exec(t);
-        if (mm2) return mm2[1];
-        break; // first non-empty line had other code → stop
-    }
-    return null;
-}
-
 async function removeDirRecursive(dir: string) {
     try {
         const entries = await fs.readdir(dir, { withFileTypes: true } as any);
@@ -1001,6 +988,133 @@ async function removeDirRecursive(dir: string) {
     } catch {
         // ignore
     }
+}
+
+type Behavior = {
+    offsetIndentOnSync: boolean;
+    extraIndentLevels: number;
+};
+
+function readDefaultBehavior(): Behavior {
+    const cfg = vscode.workspace.getConfiguration('templateLiteralEditor');
+    return {
+        offsetIndentOnSync: cfg.get<boolean>('offsetIndentOnSync', false),
+        extraIndentLevels: Math.max(0, cfg.get<number>('extraIndentLevels', 1) ?? 1),
+    };
+}
+
+function makeIndentString(editorOpts: vscode.TextEditorOptions, columns: number): string {
+    const insertSpaces = editorOpts.insertSpaces !== false;
+    const tabSize = typeof editorOpts.tabSize === 'number' ? editorOpts.tabSize : 4;
+    if (!insertSpaces) {
+        const tabs = Math.floor(columns / tabSize);
+        const spaces = columns % tabSize;
+        return '\t'.repeat(tabs) + ' '.repeat(spaces);
+    }
+    return ' '.repeat(columns);
+}
+
+function applyIndentOffsetTo(text: string, indent: string, eol: vscode.EndOfLine): string {
+    const nl = (eol === vscode.EndOfLine.LF) ? '\n' : '\r\n';
+    return text
+        .split(/\r\n|\r|\n/)
+        .map(line => (line.length ? indent + line : line))
+        .join(nl);
+}
+
+function stripIndentFrom(
+    text: string,
+    maxColumns: number,
+    eol: vscode.EndOfLine,
+    opts: vscode.TextEditorOptions
+): string {
+    const tabSize = typeof opts.tabSize === 'number' ? opts.tabSize : 4;
+    const nl = (eol === vscode.EndOfLine.LF) ? '\n' : '\r\n';
+    return text
+        .split(/\r\n|\r|\n/)
+        .map(line => {
+            if (!line.length) return line;
+            let i = 0, cols = 0;
+            while (i < line.length && (line[i] === ' ' || line[i] === '\t') && cols < maxColumns) {
+                if (line[i] === ' ') { cols += 1; i++; } else { cols += tabSize; i++; }
+            }
+            return line.slice(i);
+        })
+        .join(nl);
+}
+
+type Pragma = {
+    lang?: string;
+    offset?: boolean;
+    levels?: number;
+};
+
+/** Parse a single-line tle pragma either:
+ *   // tle: lang=c, offset=true, levels=1
+ * or
+ *   /* tle: lang=c, offset=true, levels=1 *\/
+ * It looks ONLY on the same line (left of backtick) OR the immediately previous non-empty line.
+ */
+function parseSingleLineTlePragma(
+    doc: vscode.TextDocument,
+    templateStart: number
+): Pragma | null {
+    const backtickPos = doc.positionAt(templateStart);
+
+    // collect up to 2 places: same line (left of backtick) + previous non-empty line
+    const spots: string[] = [];
+    spots.push(doc.lineAt(backtickPos.line).text.slice(0, backtickPos.character));
+
+    // previous non-empty line (only one)
+    let prev = backtickPos.line - 1;
+    while (prev >= 0) {
+        const t = doc.lineAt(prev).text;
+        if (t.trim().length === 0) { prev--; continue; }
+        spots.push(t);
+        break;
+    }
+
+    // regex that finds `tle:` then captures until end of comment/line (single-line only)
+    const re = /tle:\s*([^*/\r\n]+)/i;
+
+    for (const s of spots) {
+        const m = re.exec(s);
+        if (!m) continue;
+
+        const raw = m[1]; // e.g. "lang=c, offset=true, levels=1"
+        const parts = raw.split(',').map(x => x.trim()).filter(Boolean);
+
+        const out: Pragma = {};
+        for (const p of parts) {
+            const [kRaw, vRaw] = p.split('=').map(x => (x ?? '').trim());
+            const k = kRaw.toLowerCase();
+            const v = vRaw;
+
+            if (!k) continue;
+
+            if (k === 'lang') {
+                // Accept a VS Code language id or a shorthand key from DEFAULT_TAG_LANGS
+                const direct = v;
+                const mapped = DEFAULT_TAG_LANGS[v.toLowerCase()];
+                out.lang = mapped || direct;
+            } else if (k === 'offset') {
+                const vl = v.toLowerCase();
+                out.offset = (vl === 'true' || vl === '1');
+            } else if (k === 'levels') {
+                const n = Number(v);
+                if (!Number.isNaN(n) && n >= 0) out.levels = n;
+            }
+        }
+        return out;
+    }
+    return null;
+}
+
+function behaviorFrom(defaults: Behavior, pragma: Pragma | null): Behavior {
+    return {
+        offsetIndentOnSync: pragma?.offset ?? defaults.offsetIndentOnSync,
+        extraIndentLevels: pragma?.levels ?? defaults.extraIndentLevels,
+    };
 }
 
 // Cleanup on exit, to avoid stale editors on reload. Earlier this wouldn't work, and still cannot be tested on Extension
