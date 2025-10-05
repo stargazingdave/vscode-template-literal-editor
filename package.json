@@ -145,7 +145,7 @@
                 },
                 "templateLiteralEditor.stripIndentOnOpen": {
                     "type": "boolean",
-                    "default": true,
+                    "default": false,
                     "markdownDescription": "When opening the subdocument, strip indentation relative to the start of the line with the opening backtick so editing is flush-left."
                 },
                 "templateLiteralEditor.offsetIndentOnSync": {

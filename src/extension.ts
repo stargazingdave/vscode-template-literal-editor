@@ -305,12 +305,15 @@ export function activate(_context: vscode.ExtensionContext) {
         const openedRaw = doc.getText(templateRange);
         const nl = (doc.eol === vscode.EndOfLine.LF) ? '\n' : '\r\n';
 
-        // 1) strip indent so the subdoc is flush-left
-        let openedContent = stripIndentFrom(openedRaw, baseCols, doc.eol, editor.options);
+        // REPLACE this:
+        // let openedContent = stripIndentFrom(openedRaw, baseCols, doc.eol, editor.options);
 
-        // 2) ensure EXACTLY one leading blank line, independent of current content/EOL
-        //    - if there are 0, we add 1
-        //    - if there are 2+, we collapse to 1
+        // WITH this:
+        let openedContent = behavior.stripIndentOnOpen
+            ? stripIndentFrom(openedRaw, baseCols, doc.eol, editor.options)
+            : openedRaw;
+
+        // keep your “exactly one leading blank line” normalization if you still want it:
         openedContent = openedContent.replace(/^(?:\r?\n)*/, nl);
 
         await fs.writeFile(tempPath, openedContent, 'utf8');
@@ -993,6 +996,7 @@ async function removeDirRecursive(dir: string) {
 }
 
 type Behavior = {
+    stripIndentOnOpen: boolean;   // NEW
     offsetIndentOnSync: boolean;
     extraIndentLevels: number;
 };
@@ -1000,6 +1004,7 @@ type Behavior = {
 function readDefaultBehavior(): Behavior {
     const cfg = vscode.workspace.getConfiguration('templateLiteralEditor');
     return {
+        stripIndentOnOpen: cfg.get<boolean>('stripIndentOnOpen', false),
         offsetIndentOnSync: cfg.get<boolean>('offsetIndentOnSync', false),
         extraIndentLevels: Math.max(0, cfg.get<number>('extraIndentLevels', 1) ?? 1),
     };
@@ -1047,6 +1052,7 @@ function stripIndentFrom(
 
 type Pragma = {
     lang?: string;
+    strip?: boolean;
     offset?: boolean;
     levels?: number;
 };
@@ -1105,6 +1111,9 @@ function parseSingleLineTlePragma(
             } else if (k === 'levels') {
                 const n = Number(v);
                 if (!Number.isNaN(n) && n >= 0) out.levels = n;
+            } else if (k === 'strip' || k === 'stripindent') {
+                const vl = v.toLowerCase();
+                out.strip = (vl === 'true' || vl === '1');
             }
         }
         return out;
@@ -1114,6 +1123,7 @@ function parseSingleLineTlePragma(
 
 function behaviorFrom(defaults: Behavior, pragma: Pragma | null): Behavior {
     return {
+        stripIndentOnOpen: pragma?.strip ?? defaults.stripIndentOnOpen,   // NEW
         offsetIndentOnSync: pragma?.offset ?? defaults.offsetIndentOnSync,
         extraIndentLevels: pragma?.levels ?? defaults.extraIndentLevels,
     };
