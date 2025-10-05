@@ -11,6 +11,12 @@ import throttle = require('lodash.throttle');
 
 const SYNC_THROTTLE_MS = 100;
 
+const isJsTsLanguageId = (lang: string) =>
+    lang === 'typescript' ||
+    lang === 'typescriptreact' ||
+    lang === 'javascript' ||
+    lang === 'javascriptreact';
+
 const DEBUG = false;
 
 if (DEBUG) {
@@ -54,7 +60,11 @@ export function activate(_context: vscode.ExtensionContext) {
             await findAndOpenLiteralUnderCursor(editor);
         } catch (err) {
             if (DEBUG) {
-                console.error('openSubdocument error: %s', err && err.stack || err);
+                if (err instanceof Error && err.stack) {
+                    console.error('openSubdocument error: %s', err.stack);
+                } else {
+                    console.error('openSubdocument error: %s', err);
+                }
             }
         } finally {
             opening = false;
@@ -69,7 +79,11 @@ export function activate(_context: vscode.ExtensionContext) {
             }
         } catch (err) {
             if (DEBUG) {
-                console.error('closeSubdocuments error: %s', err && err.stack || err);
+                if (err instanceof Error && err.stack) {
+                    console.error('openSubdocument error: %s', err.stack);
+                } else {
+                    console.error('openSubdocument error: %s', err);
+                }
             }
         }
     });
@@ -89,13 +103,27 @@ export function activate(_context: vscode.ExtensionContext) {
                 try {
                     matcher = new RegExp(config.get(doc.languageId) as string, 'g');
                 } catch (err) {
-                    console.error(
-                        'INVALID REGEX in templateLiteralEditor.regexes.%s: %s\n%s',
-                        doc.languageId, config.get(doc.languageId), err && err.stack || err
-                    );
-                    await vscode.window.showErrorMessage(
-                        `Invalid regex in templateLiteralEditor.regexes.${doc.languageId}: ${config.get(doc.languageId)}\n${err && err.stack || err}`
-                    );
+                    if (err instanceof Error && err.stack) {
+                        console.error(
+                            'INVALID REGEX in templateLiteralEditor.regexes.%s: %s\n%s',
+                            doc.languageId, config.get(doc.languageId), err.stack
+                        );
+
+                        await vscode.window.showErrorMessage(
+                            `Invalid regex in templateLiteralEditor.regexes.${doc.languageId}: ${config.get(doc.languageId)}\n${err && err.stack || err}`
+                        );
+                    } else {
+                        console.error(
+                            'INVALID REGEX in templateLiteralEditor.regexes.%s: %s\n%s',
+                            doc.languageId, config.get(doc.languageId), err
+                        );
+
+                        await vscode.window.showErrorMessage(
+                            `Invalid regex in templateLiteralEditor.regexes.${doc.languageId}: ${config.get(doc.languageId)}\n${err}`
+                        );
+                    }
+
+
                     throw err;
                 }
                 let match: RegExpExecArray | null;
@@ -113,7 +141,7 @@ export function activate(_context: vscode.ExtensionContext) {
                         }
                     }
                 }
-            } else if (doc.languageId === 'typescript' || doc.languageId === 'javascript') {
+            } else if (isJsTsLanguageId(doc.languageId)) {
                 // Default JS and TS to proper tokenizing instead of regexp matching
                 const source = ts.createSourceFile(doc.fileName, doc.getText(), ts.ScriptTarget.Latest, /*setParentNodes*/ true);
                 // Find the outermost template literal
@@ -155,7 +183,11 @@ export function activate(_context: vscode.ExtensionContext) {
                         );
                     } catch (err) {
                         if (DEBUG) {
-                            console.error('ACTIVATION ERROR: %s', err && err.stack || err);
+                            if (err instanceof Error && err.stack) {
+                                console.error('ACTIVATION ERROR: %s', err.stack);
+                            } else {
+                                console.error('ACTIVATION ERROR: %s', err);
+                            }
                         }
                         throw err;
                     };
@@ -173,7 +205,11 @@ export function activate(_context: vscode.ExtensionContext) {
             }
         } catch (err) {
             if (DEBUG) {
-                console.error('findAndOpenLiteralUnderCursor error: %s', err && err.stack || err);
+                if (err instanceof Error && err.stack) {
+                    console.error('findAndOpenLiteralUnderCursor error: %s', err.stack);
+                } else {
+                    console.error('findAndOpenLiteralUnderCursor error: %s', err);
+                }
             }
             throw err;
         }
@@ -229,7 +265,6 @@ export function activate(_context: vscode.ExtensionContext) {
         const subeditorViewColumn = editorViewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
 
         const subeditor = await vscode.window.showTextDocument(subdoc, subeditorViewColumn);
-        // Artificial delay, seems to fix original editor scrolling half a line sometimes. Perhaps due to revealLine (below).
         await shortDelay();
 
         // Move cursor to proper position
@@ -318,7 +353,11 @@ export function activate(_context: vscode.ExtensionContext) {
                     await closeSubdocumentWithReason('Source document closed. This virtual document can be closed.');
                 } catch (err) {
                     if (DEBUG) {
-                        console.error('documentCloseListener error: %s', err && err.stack || err);
+                        if (err instanceof Error && err.stack) {
+                            console.error('documentCloseListener error: %s', err.stack);
+                        } else {
+                            console.error('documentCloseListener error: %s', err);
+                        }
                     }
                 }
             }
@@ -329,7 +368,11 @@ export function activate(_context: vscode.ExtensionContext) {
                     await closeSubdocumentWithReason('Subdocument closed. This virtual document can be closed.');
                 } catch (err) {
                     if (DEBUG) {
-                        console.error('subdocumentCloseListener error: %s', err && err.stack || err);
+                        if (err instanceof Error && err.stack) {
+                            console.error('subdocumentCloseListener error: %s', err.stack);
+                        } else {
+                            console.error('subdocumentCloseListener error: %s', err);
+                        }
                     }
                 }
             }
@@ -349,10 +392,19 @@ export function activate(_context: vscode.ExtensionContext) {
         function newSaveOverride(): vscode.Disposable {
             return vscode.commands.registerTextEditorCommand('workbench.action.files.save', async () => {
                 try {
-                    await doc.save();
+                    const active = vscode.window.activeTextEditor?.document;
+                    if (active === subdoc) {
+                        await subdoc.save();   // save the temp file (lets format-on-save extensions run)
+                    } else {
+                        await doc.save();      // save the parent TS/TSX file
+                    }
                 } catch (err) {
                     if (DEBUG) {
-                        console.error('Saving of document failed: %s', err && err.stack || err);
+                        if (err instanceof Error && err.stack) {
+                            console.error('Saving of document failed: %s', err.stack);
+                        } else {
+                            console.error('Saving of document failed: %s', err);
+                        }
                     }
                     saveOverride.dispose();
                 }
@@ -550,7 +602,11 @@ export function activate(_context: vscode.ExtensionContext) {
                 }
             } catch (err) {
                 if (DEBUG) {
-                    console.error('DOC SYNC ERROR %s', err && err.stack || err);
+                    if (err instanceof Error && err.stack) {
+                        console.error('DOC SYNC ERROR %s', err.stack);
+                    } else {
+                        console.error('DOC SYNC ERROR %s', err);
+                    }
                 }
                 try {
                     await closeSubdocumentWithReason(
@@ -558,7 +614,11 @@ export function activate(_context: vscode.ExtensionContext) {
                     );
                 } catch (err2) {
                     if (DEBUG) {
-                        console.error('throttledSyncToDocument error: %s', err2 && err2.stack || err2);
+                        if (err2 instanceof Error && err2.stack) {
+                            console.error('throttledSyncToDocument error: %s', err2.stack);
+                        } else {
+                            console.error('throttledSyncToDocument error: %s', err2);
+                        }
                     }
                 }
             } finally {
@@ -609,7 +669,11 @@ export function activate(_context: vscode.ExtensionContext) {
                 }
             } catch (err) {
                 if (DEBUG) {
-                    console.error('SUBDOC SYNC ERROR %s', err && err.stack || err);
+                    if (err instanceof Error && err.stack) {
+                        console.error('SUBDOC SYNC ERROR %s', err.stack);
+                    } else {
+                        console.error('SUBDOC SYNC ERROR %s', err);
+                    }
                 }
                 try {
                     await closeSubdocumentWithReason(
@@ -617,7 +681,11 @@ export function activate(_context: vscode.ExtensionContext) {
                     );
                 } catch (err2) {
                     if (DEBUG) {
-                        console.error('throttledSyncToSubdocument error: %s', err2 && err2.stack || err2);
+                        if (err2 instanceof Error && err2.stack) {
+                            console.error('throttledSyncToSubdocument error: %s', err2.stack);
+                        } else {
+                            console.error('throttledSyncToSubdocument error: %s', err2);
+                        }
                     }
                 }
             } finally {
@@ -646,7 +714,11 @@ export function activate(_context: vscode.ExtensionContext) {
 
             } catch (err) {
                 if (DEBUG) {
-                    console.error('closeSubdocumentWithReason error: %s', err && err.stack || err);
+                    if (err instanceof Error && err.stack) {
+                        console.error('closeSubdocumentWithReason error: %s', err.stack);
+                    } else {
+                        console.error('closeSubdocumentWithReason error: %s', err);
+                    }
                 }
                 throw err;
             }
@@ -750,7 +822,11 @@ export function activate(_context: vscode.ExtensionContext) {
                     }
                 } catch (err) {
                     if (DEBUG) {
-                        console.error('DISPOSE ERR %s', err && err.stack || err);
+                        if (err instanceof Error && err.stack) {
+                            console.error('DISPOSE ERR %s', err.stack);
+                        } else {
+                            console.error('DISPOSE ERR %s', err);
+                        }
                     }
                 }
             }
@@ -810,7 +886,11 @@ export async function deactivate(_context: vscode.ExtensionContext) {
         }
     } catch (err) {
         if (DEBUG) {
-            console.error('DEACTIVATE error: %s', err && err.stack || err);
+            if (err instanceof Error && err.stack) {
+                console.error('DEACTIVATE error: %s', err.stack);
+            } else {
+                console.error('DEACTIVATE error: %s', err);
+            }
         }
     }
 }
